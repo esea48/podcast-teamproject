@@ -6,6 +6,8 @@ Stage 1 — Transcript Ingestion
 Accepts a class transcript from:
   - Pasted text (string)
   - Uploaded .txt file (file path from Gradio)
+  - Uploaded PDF file
+  - Web article URL
 
 Returns a TranscriptData dataclass — the contract passed to llm_processor.py.
 """
@@ -14,8 +16,10 @@ from __future__ import annotations
 
 import re
 import logging
+import requests
 from dataclasses import dataclass, field
 from pathlib import Path
+from bs4 import BeautifulSoup
 from typing import Optional
 
 logger = logging.getLogger(__name__)
@@ -105,15 +109,117 @@ def _clean_text(text: str) -> str:
     return result
 
 
+def _is_pdf(file_path: str) -> bool:
+    """Check if a file is a PDF by reading its first 4 magic bytes."""
+    try:
+        with open(file_path, "rb") as f:
+            return f.read(4) == b"%PDF"
+    except Exception:
+        return False
+
+
+def load_pdf(file_path: str) -> TranscriptData:
+    """Extract text from a PDF file."""
+    try:
+        import PyPDF2
+        with open(file_path, "rb") as f:
+            reader = PyPDF2.PdfReader(f)
+            pages  = []
+            for page in reader.pages:
+                text = page.extract_text()
+                if text:
+                    pages.append(text)
+
+        raw_text = "\n\n".join(pages)
+
+        if not raw_text.strip():
+            return TranscriptData(
+                raw_text   = "",
+                clean_text = "",
+                error      = "No text found in PDF. It may be a scanned image — try copy-pasting the text instead."
+            )
+
+        meta     = _extract_metadata(raw_text)
+        segments = _parse_segments(raw_text)
+        clean    = _clean_text(raw_text)
+
+        result = TranscriptData(
+            raw_text   = raw_text,
+            clean_text = clean,
+            class_name = meta["class_name"],
+            date       = meta["date"],
+            instructor = meta["instructor"],
+            segments   = segments,
+        )
+        logger.info("PDF loaded — %s", result.summary())
+        return result
+
+    except Exception as exc:
+        return TranscriptData(
+            raw_text   = "",
+            clean_text = "",
+            error      = f"PDF error: {exc}"
+        )
+
+
+def load_url(url: str) -> TranscriptData:
+    """Scrape a web article and extract readable text."""
+    try:
+        headers  = {"User-Agent": "Mozilla/5.0 (compatible; PodcastStudioBot/1.0)"}
+        response = requests.get(url, headers=headers, timeout=15)
+        response.raise_for_status()
+
+        soup = BeautifulSoup(response.text, "html.parser")
+
+        for tag in soup(["script", "style", "nav", "footer", "header", "aside"]):
+            tag.decompose()
+
+        article  = soup.find("article") or soup.find("main") or soup.body
+        raw_text = article.get_text(separator="\n") if article else soup.get_text(separator="\n")
+        title    = soup.title.string.strip() if soup.title else url
+
+        if not raw_text.strip():
+            return TranscriptData(
+                raw_text   = "",
+                clean_text = "",
+                error      = "Could not extract text from that URL."
+            )
+
+        clean = _clean_text(raw_text)
+
+        result = TranscriptData(
+            raw_text   = raw_text,
+            clean_text = clean,
+            class_name = title[:80],
+            date       = "",
+            instructor = "",
+            segments   = [],
+        )
+        logger.info("URL loaded — %s (%d words)", title[:50], result.word_count)
+        return result
+
+    except requests.exceptions.RequestException as exc:
+        return TranscriptData(
+            raw_text   = "",
+            clean_text = "",
+            error      = f"Could not fetch URL: {exc}"
+        )
+
+
 def load_transcript(source: str | Path) -> TranscriptData:
     """
     Load and clean a class transcript from a file path or raw string.
+    Automatically detects PDF files by magic bytes.
     Returns TranscriptData ready for llm_processor.generate_recap()
     """
     source_str  = str(source)
     is_filepath = "\n" not in source_str and Path(source_str).exists()
 
     if is_filepath:
+        # Detect PDF by extension OR magic bytes (handles Gradio temp files)
+        if source_str.lower().endswith(".pdf") or _is_pdf(source_str):
+            return load_pdf(source_str)
+
         logger.info("Loading from file: %s", source_str)
         try:
             raw_text = Path(source_str).read_text(encoding="utf-8")

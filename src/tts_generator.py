@@ -25,7 +25,12 @@ logger = logging.getLogger(__name__)
 OUTPUT_DIR = Path("output")
 OUTPUT_DIR.mkdir(exist_ok=True)
 
-_VOICE         = "nova"
+# Voice mapping — Female and Male options
+VOICE_MAP = {
+    "Female": "nova",
+    "Male":   "onyx",
+}
+
 _TTS_CHUNK_MAX = 4000
 
 
@@ -81,7 +86,7 @@ def _safe_filename(text: str, max_len: int = 40) -> str:
     return safe[:max_len] or "recap"
 
 
-def _generate_openai(text: str, output_path: Path) -> None:
+def _generate_openai(text: str, output_path: Path, voice: str) -> None:
     """Generate MP3 via OpenAI TTS."""
     from openai import OpenAI
 
@@ -91,14 +96,14 @@ def _generate_openai(text: str, output_path: Path) -> None:
 
     client = OpenAI(api_key=api_key)
     chunks = _chunk_text(text)
-    logger.info("OpenAI TTS: %d chunk(s), voice=%s", len(chunks), _VOICE)
+    logger.info("OpenAI TTS: %d chunk(s), voice=%s", len(chunks), voice)
 
     all_bytes = bytearray()
     for i, chunk in enumerate(chunks):
         logger.info("  Chunk %d/%d (%d chars)", i + 1, len(chunks), len(chunk))
         response = client.audio.speech.create(
             model           = "tts-1",
-            voice           = _VOICE,
+            voice           = voice,
             input           = chunk,
             response_format = "mp3",
         )
@@ -119,11 +124,7 @@ def _generate_gtts(text: str, output_path: Path) -> None:
     gTTS(text=text, lang="en", slow=False).save(str(output_path))
 
 
-def generate_audio(script, filename: Optional[str] = None) -> AudioResult:
-    """
-    Convert a RecapScript into an MP3 audio file.
-    Uses OpenAI TTS if OPENAI_API_KEY is set, otherwise falls back to gTTS.
-    """
+def generate_audio(script, voice: str = "Female", filename: Optional[str] = None) -> AudioResult:
     if not script.is_valid:
         return AudioResult(
             success = False,
@@ -131,6 +132,15 @@ def generate_audio(script, filename: Optional[str] = None) -> AudioResult:
         )
 
     tts_text = script.to_tts_text()
+
+    # ADD THESE LINES:
+    max_words  = 2100  # 140 wpm × 15 mins
+    word_count = len(tts_text.split())
+    if word_count > max_words:
+        tts_text = " ".join(tts_text.split()[:max_words])
+        logger.warning("Script trimmed to 15 min limit (%d → %d words)", word_count, max_words)
+
+    openai_voice = VOICE_MAP.get(voice, "nova")
 
     if not filename:
         filename = f"recap_{_safe_filename(script.class_name)}_{int(time.time())}"
@@ -141,7 +151,7 @@ def generate_audio(script, filename: Optional[str] = None) -> AudioResult:
 
     try:
         if provider == "openai":
-            _generate_openai(tts_text, output_path)
+            _generate_openai(tts_text, output_path, voice=openai_voice)
         else:
             _generate_gtts(tts_text, output_path)
 
